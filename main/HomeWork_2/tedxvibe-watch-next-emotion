@@ -1,0 +1,439 @@
+import sys
+
+from pyspark.sql.functions import (
+    col, collect_list, count, desc, explode, explode_outer,
+    row_number, coalesce, lit, struct, expr, sum
+)
+from pyspark.sql.window import Window
+
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+
+
+
+##### INIT
+
+args = getResolvedOptions(sys.argv, ["JOB_NAME"])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+job = Job(glueContext)
+job.init(args["JOB_NAME"], args)
+
+
+#####  PATH
+
+BUCKET = "tedx-2026-data-mp-massigerva2"
+
+tedx_path   = f"s3://{BUCKET}/final_list.csv"
+details_path = f"s3://{BUCKET}/details.csv"
+tags_path    = f"s3://{BUCKET}/tags.csv"
+watch_path   = f"s3://{BUCKET}/related_videos.csv"
+
+
+##### LOAD DATA
+tedx = spark.read.option("header", True).csv(tedx_path)
+
+details = spark.read.option("header", True).csv(details_path)
+
+tags = spark.read.option("header", True).csv(tags_path)
+
+watch = spark.read.option("header", True).csv(watch_path)
+
+
+##### DETAILS JOIN
+
+details_clean = details.select(
+    col("id").alias("id_ref"),
+    col("description"),
+    col("duration"),
+    col("publishedAt"),
+    col("interalId")  # mantenuto per mapping
+)
+
+tedx_main = tedx.join(
+    details_clean,
+    tedx.id == details_clean.id_ref,
+    "left"
+).drop("id_ref")
+
+
+
+##### TAGS AGGREGATION
+tags_agg = tags.groupBy("id") \
+    .agg(collect_list("tag").alias("tags"))
+
+tedx_full = tedx_main.join(
+    tags_agg,
+    tedx_main.id == tags_agg.id,
+    "left"
+).drop(tags_agg.id)
+
+
+
+##### WATCH NEXT BASE (original signal)
+
+internal_map = details.select(
+    col("interalId").alias("internal"),
+    col("id").alias("public_id")
+)
+
+watch_resolved = watch.join(
+    internal_map,
+    watch.related_id == internal_map.internal,
+    "left"
+).select(
+    col("id").alias("source_id"),
+    col("public_id").alias("target_id"),
+    col("viewedCount").cast("long").alias("views")
+).filter(col("target_id").isNotNull())
+
+
+w = Window.partitionBy("source_id").orderBy(desc("views"))
+
+watch_ranked = watch_resolved.withColumn(
+    "rn",
+    row_number().over(w)
+)
+
+watch_original = watch_ranked.filter(col("rn") <= 10) \
+    .groupBy("source_id") \
+    .agg(collect_list("target_id").alias("watch_next_original"))
+
+
+
+##### EMOTION MAP
+
+
+emotion_map = [
+    {
+        "_id": "stress",
+        "tags": [
+            "mindfulness",
+            "meditation",
+            "sleep",
+            "therapy",
+            "trust",
+            "psychology",
+            "health",
+            "work-life balance",
+            "nature"
+        ]
+    },
+    {
+        "_id": "tristezza",
+        "tags": [
+            "happiness",
+            "love",
+            "personal growth",
+            "vulnerability",
+            "compassion",
+            "empathy",
+            "community",
+            "humor",
+            "friendship"
+        ]
+    },
+    {
+        "_id": "paura",
+        "tags": [
+            "trust",
+            "vulnerability",
+            "philosophy",
+            "personal growth",
+            "humanity",
+            "empathy",
+            "motivation"
+        ]
+    },
+    {
+        "_id": "depressione",
+        "tags": [
+            "mental health",
+            "therapy",
+            "personal growth",
+            "happiness",
+            "mindfulness",
+            "meditation",
+            "spirituality",
+            "depression",
+            "love"
+        ]
+    },
+    {
+        "_id": "rabbia",
+        "tags": [
+            "activism",
+            "social change",
+            "equality",
+            "human rights",
+            "justice system",
+            "empathy",
+            "compassion",
+            "community"
+        ]
+    },
+    {
+        "_id": "stanchezza",
+        "tags": [
+            "sleep",
+            "work-life balance",
+            "mindfulness",
+            "nature",
+            "exercise",
+            "health",
+            "meditation",
+            "humor"
+        ]
+    },
+    {
+        "_id": "motivazione",
+        "tags": [
+            "motivation",
+            "leadership",
+            "success",
+            "goals",
+            "potential",
+            "productivity",
+            "personal growth",
+            "innovation"
+        ]
+    },
+    {
+        "_id": "felicita",
+        "tags": [
+            "happiness",
+            "love",
+            "humor",
+            "comedy",
+            "family",
+            "friendship",
+            "music",
+            "creativity",
+            "community"
+        ]
+    },
+    {
+        "_id": "curiosita",
+        "tags": [
+            "curiosity",
+            "science",
+            "discovery",
+            "innovation",
+            "future",
+            "brain",
+            "philosophy",
+            "neuroscience",
+            "creativity"
+        ]
+    },
+    {
+        "_id": "crescita",
+        "tags": [
+            "personal growth",
+            "self",
+            "identity",
+            "psychology",
+            "communication",
+            "leadership",
+            "work",
+            "goals",
+            "potential"
+        ]
+    }
+]
+
+emotion_df = spark.createDataFrame(emotion_map, ["emotion", "tags"])
+emotion_exploded = emotion_df.select(
+    col("emotion"),
+    explode(col("tags")).alias("tag")
+)
+
+
+##### VIDEO → EMOTION
+video_tags = tedx_full.select(
+    col("id").alias("video_id"),
+    explode_outer("tags").alias("tag")
+).filter(col("tag").isNotNull())
+
+video_emotion = video_tags.join(
+    emotion_exploded,
+    "tag",
+    "inner"
+)
+
+video_emotion_score = video_emotion.groupBy(
+    "video_id", "emotion"
+).agg(
+    count("*").alias("score")
+)
+
+w_em = Window.partitionBy("video_id").orderBy(desc("score"))
+
+video_emotion_final = video_emotion_score.withColumn(
+    "rn",
+    row_number().over(w_em)
+).filter(col("rn") == 1) \
+ .select(
+    col("video_id").alias("id"),
+    col("emotion")
+)
+
+
+tedx_full = tedx_full.join(
+    video_emotion_final,
+    "id",
+    "left"
+).withColumn(
+    "emotion",
+    coalesce(col("emotion"), lit("unknown"))
+)
+
+
+##### TAG SIMILARITY
+tags_a = tedx_full.select(col("id").alias("a"), explode_outer("tags").alias("tag"))
+tags_b = tedx_full.select(col("id").alias("b"), explode_outer("tags").alias("tag"))
+
+tag_pairs = tags_a.join(tags_b, "tag") \
+    .filter(col("a") != col("b")) \
+    .groupBy("a", "b") \
+    .agg(count("*").alias("shared")) \
+    .withColumnRenamed("a", "source_id") \
+    .withColumnRenamed("b", "target_id")
+
+
+
+##### EMOTION PAIRS
+emotion_pairs = tedx_full.select(
+    col("id").alias("a"),
+    col("emotion").alias("ea")
+).join(
+    tedx_full.select(
+        col("id").alias("b"),
+        col("emotion").alias("eb")
+    ),
+    col("ea") == col("eb")
+).filter(col("a") != col("b")) \
+ .select(col("a").alias("source_id"), col("b").alias("target_id"))
+
+##### EMOTION BASED RECOMMENDATION (con popolarità)
+
+# Popolarità per talk: somma totale views come target
+popularity = watch_resolved.groupBy("target_id") \
+    .agg(sum("views").alias("total_views"))
+
+emotion_rec = emotion_pairs.join(
+    tag_pairs,
+    ["source_id", "target_id"],
+    "left"
+).join(
+    popularity,
+    emotion_pairs.target_id == popularity.target_id,
+    "left"
+).drop(popularity.target_id) \
+.withColumn("shared", coalesce(col("shared"), lit(0))) \
+.withColumn("total_views", coalesce(col("total_views"), lit(0))) \
+.withColumn(
+    "score",
+    col("shared") * lit(10) + col("total_views") / lit(100000)
+)
+
+w2 = Window.partitionBy("source_id").orderBy(desc("score"))
+
+emotion_rec_final = emotion_rec.withColumn(
+    "rn", row_number().over(w2)
+).filter(col("rn") <= 10) \
+ .groupBy("source_id") \
+ .agg(collect_list("target_id").alias("watch_next_emotion"))
+
+##### TAG RECOMMENDATION (FALLBACK)
+
+tag_rec = tag_pairs.withColumn(
+    "score",
+    col("shared")
+)
+
+w3 = Window.partitionBy("source_id").orderBy(desc("score"))
+
+tag_rec_final = tag_rec.withColumn(
+    "rn",
+    row_number().over(w3)
+).filter(col("rn") <= 10) \
+ .groupBy("source_id") \
+ .agg(collect_list("target_id").alias("watch_next_tags"))
+
+
+  
+##### JOIN FINAL
+
+tedx_full = tedx_full.join(
+    emotion_rec_final,
+    tedx_full.id == emotion_rec_final.source_id,
+    "left"
+).drop("source_id")
+
+tedx_full = tedx_full.join(
+    tag_rec_final,
+    tedx_full.id == tag_rec_final.source_id,
+    "left"
+).drop("source_id")
+
+tedx_full = tedx_full.join(
+    watch_original,
+    tedx_full.id == watch_original.source_id,
+    "left"
+).drop("source_id")
+
+
+##### FINAL WATCH NEXT (HYBRID)
+
+tedx_full = tedx_full.withColumn(
+    "watch_next",
+    coalesce(
+        col("watch_next_emotion"),
+        col("watch_next_tags"),
+        col("watch_next_original")
+    )
+).drop(
+    "watch_next_emotion",
+    "watch_next_tags",
+    "watch_next_original"
+)
+
+
+##### FINAL FORMAT FOR MONGO
+
+final_df = tedx_full.select(
+    col("id").alias("_id"),
+    col("emotion"),
+    col("tags"),
+    col("description"),
+    col("duration"),
+    col("publishedAt"),
+    col("watch_next")
+)
+
+
+final_df.printSchema()
+
+##### WRITE TO MONGO
+
+dynamic_frame = DynamicFrame.fromDF(final_df, glueContext, "mongo")
+
+glueContext.write_dynamic_frame.from_options(
+    frame=dynamic_frame,
+    connection_type="mongodb",
+    connection_options={
+        "connectionName": "TEDx",
+        "database": "unibg_tedx_2026",
+        "collection": "tedx_data"
+    }
+)
+
+
+job.commit()
+print("JOB COMPLETATO")
